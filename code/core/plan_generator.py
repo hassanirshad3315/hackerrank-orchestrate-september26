@@ -1,6 +1,7 @@
 """
 Deterministic plan generator for evaluating payment options and spending change candidates.
 Generates full payment, partial payment, installment, wait, and fallback candidates.
+Optimized with suffix-margin analysis for instant O(1) safety evaluations.
 """
 
 from dataclasses import dataclass, field
@@ -89,19 +90,38 @@ class PlanGenerator:
         profile = self.reconciler.profiles[user_id]
         considered_methods = profile.payment_methods_user_will_consider
         max_inst_months = profile.max_installment_months
+        min_balance = profile.minimum_balance_to_keep
 
         # 1. Baseline forecast with NO spending changes and NO payments
-        base_forecast = self.forecaster.forecast_user_balance(user_id, request_date)
+        base_res = self.forecaster.forecast_user_balance(user_id, request_date)
+        sorted_dates = sorted(base_res.daily_balances.keys())
+        date_to_idx = {d: i for i, d in enumerate(sorted_dates)}
         
+        # Suffix min margins: margin[i] = min balance from date i to end_date - min_balance_to_keep
+        end_balances = [base_res.daily_balances[d].end_balance for d in sorted_dates]
+        start_balances = [base_res.daily_balances[d].start_balance for d in sorted_dates]
+        debits = [base_res.daily_balances[d].debits for d in sorted_dates]
+        
+        # Daily min margin accounting for intraday dips
+        daily_min_margins = [
+            min(start_balances[i] - debits[i], end_balances[i]) - min_balance
+            for i in range(len(sorted_dates))
+        ]
+        
+        suffix_min_margins = list(daily_min_margins)
+        for i in range(len(daily_min_margins) - 2, -1, -1):
+            suffix_min_margins[i] = min(suffix_min_margins[i], suffix_min_margins[i + 1])
+
         # 2. Determine amount_safe_to_pay on request_date
-        amount_safe_to_pay = self._compute_amount_safe_to_pay(
-            user_id, request_date, requested_amount, profile.minimum_balance_to_keep
-        )
+        margin_today = suffix_min_margins[0] if suffix_min_margins else 0.0
+        amount_safe_to_pay = max(0.0, min(requested_amount, round(margin_today, 2)))
 
         # 3. Determine earliest_date_for_full_payment
-        earliest_full_date = self._find_earliest_date_for_full_payment(
-            user_id, request_date, requested_amount, profile.minimum_balance_to_keep
-        )
+        earliest_full_date: Optional[date] = None
+        for i, d in enumerate(sorted_dates):
+            if suffix_min_margins[i] >= requested_amount - 1e-4:
+                earliest_full_date = d
+                break
 
         earliest_full_str = earliest_full_date.strftime("%Y-%m-%d") if earliest_full_date else ""
 
@@ -111,10 +131,8 @@ class PlanGenerator:
 
         # 4. Evaluate Full Payment on request_date
         if METHOD_FULL_PAYMENT in considered_methods:
-            full_safe = self._test_plan_safety(
-                user_id, request_date, [(request_date, requested_amount)], []
-            )
-            if full_safe:
+            is_safe = (margin_today >= requested_amount - 1e-4)
+            if is_safe:
                 candidates.append(
                     PlanCandidate(
                         request_id=request_id,
@@ -164,7 +182,8 @@ class PlanGenerator:
                 last_d = schedule[-1][0]
                 completes = (last_d <= desired_completion_date)
 
-                is_safe = self._test_plan_safety(user_id, request_date, schedule, [])
+                # Test safety of installments schedule against baseline
+                is_safe = self._test_schedule_safety(schedule, sorted_dates, daily_min_margins)
                 if is_safe:
                     plan_str = "|".join(f"{d.strftime('%Y-%m-%d')}:{format_amount(amt)}" for d, amt in schedule)
                     candidates.append(
@@ -200,7 +219,7 @@ class PlanGenerator:
         ):
             remaining_amt = round(requested_amount - amount_safe_to_pay, 2)
             part_schedule = [(request_date, amount_safe_to_pay), (earliest_full_date, remaining_amt)]
-            if self._test_plan_safety(user_id, request_date, part_schedule, []):
+            if self._test_schedule_safety(part_schedule, sorted_dates, daily_min_margins):
                 plan_str = f"{request_date.strftime('%Y-%m-%d')}:{format_amount(amount_safe_to_pay)}|{earliest_full_date.strftime('%Y-%m-%d')}:{format_amount(remaining_amt)}"
                 candidates.append(
                     PlanCandidate(
@@ -291,54 +310,32 @@ class PlanGenerator:
 
         return amount_safe_to_pay, earliest_full_date, candidates
 
-    def _test_plan_safety(
+    def _test_schedule_safety(
         self,
-        user_id: str,
-        start_date: date,
-        payments: List[Tuple[date, float]],
-        spending_changes: List[str],
+        schedule: List[Tuple[date, float]],
+        sorted_dates: List[date],
+        daily_min_margins: List[float],
     ) -> bool:
-        res = self.forecaster.forecast_user_balance(
-            user_id=user_id,
-            start_date=start_date,
-            spending_changes=spending_changes,
-            additional_payments=payments,
-        )
-        return res.min_projected_balance >= res.minimum_balance_to_keep
+        """
+        Fast safety check for a multi-payment schedule against daily baseline margins.
+        """
+        date_to_idx = {d: i for i, d in enumerate(sorted_dates)}
+        cum_impact = [0.0] * len(sorted_dates)
+        
+        for p_date, p_amt in schedule:
+            if p_date in date_to_idx:
+                idx = date_to_idx[p_date]
+                cum_impact[idx] += p_amt
+            elif p_date < sorted_dates[0]:
+                cum_impact[0] += p_amt
 
-    def _compute_amount_safe_to_pay(
-        self, user_id: str, request_date: date, requested_amount: float, min_balance_to_keep: float
-    ) -> float:
-        # Binary search for maximum safe payment today
-        low = 0.0
-        high = requested_amount
-        best_safe = 0.0
-
-        # Step check
-        for test_amt in [requested_amount, 0.0]:
-            if test_amt > 0:
-                if self._test_plan_safety(user_id, request_date, [(request_date, test_amt)], []):
-                    return test_amt
-
-        # Binary search with 0.01 precision
-        for _ in range(25):
-            mid = (low + high) / 2.0
-            if self._test_plan_safety(user_id, request_date, [(request_date, mid)], []):
-                best_safe = mid
-                low = mid
-            else:
-                high = mid
-
-        return round(best_safe, 2)
-
-    def _find_earliest_date_for_full_payment(
-        self, user_id: str, request_date: date, requested_amount: float, min_balance_to_keep: float
-    ) -> Optional[date]:
-        for day_offset in range(FORECAST_HORIZON_DAYS + 1):
-            check_d = request_date + timedelta(days=day_offset)
-            if self._test_plan_safety(user_id, request_date, [(check_d, requested_amount)], []):
-                return check_d
-        return None
+        # Propagate cumulative deductions forward
+        running_deduction = 0.0
+        for i in range(len(sorted_dates)):
+            running_deduction += cum_impact[i]
+            if daily_min_margins[i] - running_deduction < -1e-4:
+                return False
+        return True
 
     def _evaluate_spending_reduction_plans(
         self,
@@ -357,7 +354,6 @@ class PlanGenerator:
         future_events, patterns = self.reconciler.reconcile_user_events(user_id, request_date)
         candidates: List[PlanCandidate] = []
 
-        # Find adjustable flexible events
         stoppable_events: List[RecurringPattern] = []
         reducible_events: List[RecurringPattern] = []
 
@@ -374,7 +370,13 @@ class PlanGenerator:
         if METHOD_FULL_PAYMENT in considered_methods:
             for p in stoppable_events:
                 sc = [f"stop:{p.representative_event_id}"]
-                if self._test_plan_safety(user_id, request_date, [(request_date, requested_amount)], sc):
+                res = self.forecaster.forecast_user_balance(
+                    user_id=user_id,
+                    start_date=request_date,
+                    spending_changes=sc,
+                    additional_payments=[(request_date, requested_amount)],
+                )
+                if res.min_projected_balance >= res.minimum_balance_to_keep:
                     candidates.append(
                         PlanCandidate(
                             request_id=request_id,
@@ -402,7 +404,13 @@ class PlanGenerator:
             for p in reducible_events:
                 min_floor = p.minimum_allowed_amount if p.minimum_allowed_amount is not None else 0.0
                 sc = [f"reduce_to:{p.representative_event_id}:{format_amount(min_floor)}"]
-                if self._test_plan_safety(user_id, request_date, [(request_date, requested_amount)], sc):
+                res = self.forecaster.forecast_user_balance(
+                    user_id=user_id,
+                    start_date=request_date,
+                    spending_changes=sc,
+                    additional_payments=[(request_date, requested_amount)],
+                )
+                if res.min_projected_balance >= res.minimum_balance_to_keep:
                     candidates.append(
                         PlanCandidate(
                             request_id=request_id,
